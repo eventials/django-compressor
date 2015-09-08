@@ -1,6 +1,7 @@
 # flake8: noqa
 import os
 import sys
+from multiprocessing import Pool
 
 from fnmatch import fnmatch
 from optparse import make_option
@@ -13,6 +14,7 @@ from django.utils import six
 from django.utils.datastructures import SortedDict
 from django.utils.importlib import import_module
 from django.template.loader import get_template  # noqa Leave this in to preload template locations
+from django.template.loader import get_template_from_string
 
 from compressor.cache import get_offline_hexdigest, write_offline_manifest
 from compressor.conf import settings
@@ -29,6 +31,19 @@ else:
         from cStringIO import StringIO
     except ImportError:
         from StringIO import StringIO
+
+
+def do_compress_template(template_name, kind, node_content):
+    try:
+        template = get_template_from_string(node_content)
+
+        node = CompressorNode(nodelist=template.nodelist, kind=kind)
+
+        context = Context(settings.COMPRESS_OFFLINE_CONTEXT)
+        return node.render(context, forced=True)
+    except Exception as e:
+        raise CommandError("An error occured during rendering %s: "
+                           "%s" % (template_name, e))
 
 
 class Command(NoArgsCommand):
@@ -49,6 +64,9 @@ class Command(NoArgsCommand):
         make_option('--engine', default="django", action="store",
             help="Specifies the templating engine. jinja2 or django",
             dest="engine"),
+        make_option('--workers', default="1", action="store",
+            help="Number of workers to compress the contents",
+            dest="workers"),
     )
 
     requires_model_validation = False
@@ -208,63 +226,69 @@ class Command(NoArgsCommand):
                       "\n\t".join((t.template_name
                                    for t in compressor_nodes.keys())) + "\n")
 
-        contexts = settings.COMPRESS_OFFLINE_CONTEXT
-        if isinstance(contexts, six.string_types):
-            module, function = settings.COMPRESS_OFFLINE_CONTEXT.rsplit('.', 1)
-            contexts = getattr(import_module(module), function)()
-        elif not isinstance(contexts, (list, tuple)):
-            contexts = [contexts]
+        manifest = SortedDict()
+        init_context = parser.get_init_context(settings.COMPRESS_OFFLINE_CONTEXT)
 
-        log.write("Compressing... ")
-        block_count = context_count = 0
+        for template, nodes in compressor_nodes.items():
+            context = Context(init_context)
+            template._log = log
+            template._log_verbosity = verbosity
+
+            if not parser.process_template(template, context):
+                continue
+
+            for node in nodes:
+                context.push()
+
+                parser.process_node(template, context, node)
+                rendered = parser.render_nodelist(template, context, node)
+                key = get_offline_hexdigest(rendered)
+
+                context.pop()
+
+                if not key in manifest:
+                    manifest[key] = (template, node)
+
+        num_workers = int(options.get("workers", 1))
+
+        log.write("Compressing... (%d workers)\n" % num_workers)
+
+        pool = Pool(num_workers)
+        async_results = []
+
+        for key, value in manifest.items():
+            template, node = value
+
+            node_content = node.get_original_content(context)
+
+            r = pool.apply_async(do_compress_template, args=(template.template_name, node.kind, node_content))
+            async_results.append((key, r))
+
         results = []
         offline_manifest = SortedDict()
+        count = 0
 
-        for context_dict in contexts:
-            context_count += 1
-            init_context = parser.get_init_context(context_dict)
+        for key, async_result in async_results:
+            result = async_result.get()
 
-            for template, nodes in compressor_nodes.items():
-                context = Context(init_context)
-                template._log = log
-                template._log_verbosity = verbosity
+            results.append(result)
+            count += 1
 
-                if not parser.process_template(template, context):
-                    continue
-
-                for node in nodes:
-                    context.push()
-                    parser.process_node(template, context, node)
-                    rendered = parser.render_nodelist(template, context, node)
-                    key = get_offline_hexdigest(rendered)
-
-                    if key in offline_manifest:
-                        continue
-
-                    try:
-                        result = parser.render_node(template, context, node)
-                    except Exception as e:
-                        raise CommandError("An error occured during rendering %s: "
-                                           "%s" % (template.template_name, e))
-                    offline_manifest[key] = result
-                    context.pop()
-                    results.append(result)
-                    block_count += 1
+            offline_manifest[key] = result
 
         write_offline_manifest(offline_manifest)
 
-        log.write("done\nCompressed %d block(s) from %d template(s) for %d context(s).\n" %
-                  (block_count, len(compressor_nodes), context_count))
-        return block_count, results
+        log.write("done\nCompressed %d block(s) from %d template(s).\n" %
+                  (count, len(compressor_nodes)))
+
+        return count, results
 
     def handle_extensions(self, extensions=('html',)):
         """
         organizes multiple extensions that are separated with commas or
         passed by using --extension/-e multiple times.
-
         for example: running 'django-admin compress -e js,txt -e xhtml -a'
         would result in a extension list: ['.js', '.txt', '.xhtml']
-
         >>> handle_extensions(['.html', 'html,js,py,py,py,.py', 'py,.py'])
         ['.html', '.js']
         >>> handle_extensions(['.html, txt,.tpl'])
